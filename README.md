@@ -8,6 +8,7 @@ Instead of opening each derivative chart one by one in a trading app, fno-board 
 
 - One chart tile per instrument with latest price and % change since the session's first price
 - Two tabs: **F&O Stocks** and **Indices** (Nifty 50, Sensex, Bank Nifty, Fin Nifty and more)
+- Click any tile for a detail view: a larger chart with a hover crosshair, the day's open/high/low, previous close, volume and 52-week range, plus the nearest futures contract's price, premium to spot, open interest, lot size and expiry
 - Filter by name, sort by top gainers or losers
 - Small / Medium / Large presets, or set exact column and row counts
 - Layout is remembered per tab and per screen, so a laptop and a monitor keep separate views
