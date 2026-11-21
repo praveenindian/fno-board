@@ -16,7 +16,7 @@ import pandas as pd
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 ROOT = Path(__file__).parent
 load_dotenv(ROOT / ".env")
@@ -45,9 +45,10 @@ class Board:
     def set_status(self, state, detail=""):
         self.status = {"source": SOURCE, "state": state, "detail": detail}
 
-    def add(self, sym, name, group="stocks"):
+    def add(self, sym, name, group="stocks", exchange="NSE", fut=None):
         with self.lock:
-            self.symbols.setdefault(sym, {"name": name, "group": group, "points": []})
+            self.symbols.setdefault(sym, {"name": name, "group": group, "exchange": exchange,
+                                          "fut": fut, "points": []})
 
     def tick(self, sym, price, ts=None):
         ts = ts or time.time()
@@ -118,6 +119,29 @@ def index_rows(df):
     return idx.sort_values(["rank", "trading_symbol"])
 
 
+# Index symbol -> the name its futures contracts use as underlying.
+FUT_ALIAS = {"NIFTYMIDSELECT": "MIDCPNIFTY", "NIFTYJR": "NIFTYNXT50"}
+
+
+def near_futures(df):
+    """Nearest-expiry futures contract for each underlying symbol."""
+    fut = df[(df.segment == "FNO") & (df.instrument_type == "FUT")].copy()
+    fut["expiry_date"] = fut.expiry_date.astype(str)
+    today = dt.datetime.now(IST).strftime("%Y-%m-%d")
+    out = {}
+    for r in fut[fut.expiry_date >= today].sort_values("expiry_date").itertuples():
+        out.setdefault(r.underlying_symbol, {"exchange": r.exchange, "symbol": r.trading_symbol,
+                                             "expiry": r.expiry_date, "lot": int(float(r.lot_size))})
+    return out
+
+
+def fut_for(futs, sym):
+    return futs.get(FUT_ALIAS.get(sym, sym))
+
+
+groww_client = None
+
+
 # ---------------------------------------------------------------- Groww source
 
 def parse_candle_time(t):
@@ -151,19 +175,21 @@ def groww_backfill(g, stocks):
 
 
 def run_groww():
+    global groww_client
     try:
         from growwapi import GrowwAPI, GrowwFeed
         token = GrowwAPI.get_access_token(api_key=os.environ["GROWW_API_KEY"],
                                           secret=os.environ["GROWW_API_SECRET"])
         g = GrowwAPI(token)
         df = g.get_all_instruments()
-        cash, indices = fno_stocks(df), index_rows(df)
+        cash, indices, futs = fno_stocks(df), index_rows(df), near_futures(df)
+        groww_client = g
         stock_keys, index_keys = {}, {}          # (exchange, token) -> symbol
         for r in indices.itertuples():           # indices first so they backfill first
-            board.add(r.trading_symbol, r.name, "indices")
+            board.add(r.trading_symbol, r.name, "indices", r.exchange, fut_for(futs, r.trading_symbol))
             index_keys[(r.exchange, str(r.exchange_token))] = r.trading_symbol
         for r in cash.itertuples():
-            board.add(r.trading_symbol, r.name)
+            board.add(r.trading_symbol, r.name, "stocks", r.exchange, fut_for(futs, r.trading_symbol))
             stock_keys[(r.exchange, str(r.exchange_token))] = r.trading_symbol
         as_list = lambda keys: [{"exchange": e, "segment": "CASH", "exchange_token": t}
                                 for e, t in keys]
@@ -202,13 +228,13 @@ def run_groww():
 def run_demo():
     try:
         df = pd.read_csv(INSTRUMENT_CSV, low_memory=False)
-        prices = {}
+        prices, futs = {}, near_futures(df)
         now = int(time.time()) // 60 * 60
         rows = [(r, "indices") for r in index_rows(df).itertuples()]
         rows += [(r, "stocks") for r in fno_stocks(df).itertuples()]
         for r, group in rows:
             sym = r.trading_symbol
-            board.add(sym, r.name, group)
+            board.add(sym, r.name, group, r.exchange, fut_for(futs, sym))
             p = random.uniform(9000, 80000) if group == "indices" else random.uniform(80, 4000)
             drift = random.uniform(-0.0002, 0.0002)
             hist = []
@@ -261,6 +287,67 @@ app = FastAPI(lifespan=lifespan)
 @app.get("/")
 def index():
     return FileResponse(ROOT / "static" / "index.html")
+
+
+def slim_quote(q):
+    """Keep only the quote fields the detail view shows."""
+    last, change = q.get("last_price"), q.get("day_change")
+    return {
+        "last": last,
+        "prevClose": last - change if last is not None and change is not None else None,
+        "volume": q.get("volume"),
+        "high52": q.get("week_52_high"), "low52": q.get("week_52_low"),
+        "oi": q.get("open_interest"), "oiChangePct": q.get("oi_day_change_percentage"),
+    }
+
+
+def demo_detail(sym, info):
+    pts = [p[1] for p in info["points"]] or [100.0]
+    rng = random.Random(sym)
+    stock = info["group"] == "stocks"
+    quote = {"last": pts[-1], "prevClose": round(pts[0] * (1 + rng.uniform(-0.012, 0.012)), 2),
+             "volume": rng.randrange(200_000, 30_000_000) if stock else None,
+             "high52": round(max(pts) * (1 + rng.uniform(0.04, 0.45)), 2),
+             "low52": round(min(pts) * (1 - rng.uniform(0.04, 0.35)), 2)}
+    fut = None
+    if info["fut"]:
+        fut = {"last": round(pts[-1] * (1 + rng.uniform(0.001, 0.006)), 2),
+               "oi": rng.randrange(500, 90_000) * info["fut"]["lot"],
+               "oiChangePct": round(rng.uniform(-9, 9), 2)}
+    return quote, fut
+
+
+detail_cache = {}
+
+
+@app.get("/api/detail/{sym}")
+def detail(sym: str):
+    """Extra numbers for one instrument: quote, nearest futures contract, lot size."""
+    info = board.symbols.get(sym)
+    if not info:
+        return JSONResponse({"error": "unknown symbol"}, status_code=404)
+    hit = detail_cache.get(sym)
+    if hit and time.time() - hit[0] < 5:
+        return hit[1]
+    f = info["fut"]
+    out = {"s": sym, "quote": None, "fut": None, "note": "",
+           "lot": f and f["lot"], "expiry": f and f["expiry"], "futSymbol": f and f["symbol"]}
+    if SOURCE == "demo":
+        out["quote"], out["fut"] = demo_detail(sym, info)
+    elif groww_client:
+        try:
+            out["quote"] = slim_quote(groww_client.get_quote(
+                trading_symbol=sym, exchange=info["exchange"], segment="CASH", timeout=8))
+        except Exception as e:
+            out["note"] = str(e)
+        if f:
+            try:
+                out["fut"] = slim_quote(groww_client.get_quote(
+                    trading_symbol=f["symbol"], exchange=f["exchange"], segment="FNO", timeout=8))
+            except Exception as e:
+                out["note"] = out["note"] or str(e)
+    detail_cache[sym] = (time.time(), out)
+    return out
 
 
 @app.websocket("/ws")

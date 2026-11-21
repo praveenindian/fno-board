@@ -52,6 +52,39 @@
   .up { color: var(--up); } .down { color: var(--down); } .flat { color: var(--flat); }
   canvas { display: block; width: 100%; height: var(--chart, 56px); margin-top: 4px; }
   #empty { padding: 48px 16px; text-align: center; color: var(--muted); }
+  .tile { cursor: pointer; }
+  .tile { transition: border-color 0.15s; }
+  .tile:hover { border-color: color-mix(in srgb, var(--muted) 40%, var(--line)); }
+  .tile:focus-visible { border-color: var(--accent); outline: none; }
+
+  dialog { width: min(880px, calc(100vw - 24px)); max-height: calc(100vh - 24px); padding: 0;
+           border: 1px solid var(--line); border-radius: 12px; background: var(--panel);
+           color: var(--text); overflow: auto; }
+  dialog::backdrop { background: rgba(0, 0, 0, 0.55); }
+  .d-body { padding: 16px 18px 18px; }
+  .d-head { display: flex; align-items: flex-start; gap: 12px; }
+  .d-sym { font-size: 20px; font-weight: 700; letter-spacing: -0.01em; }
+  .d-name, .d-sub { color: var(--muted); font-size: 12px; }
+  .d-price { margin-left: auto; text-align: right; font-variant-numeric: tabular-nums; }
+  .d-price #dPx { font-size: 20px; font-weight: 700; }
+  #dClose { font: inherit; font-size: 20px; line-height: 1; width: 32px; height: 32px; flex: none;
+            border: 1px solid var(--line); border-radius: 8px; background: transparent;
+            color: var(--muted); cursor: pointer; }
+  #dClose:hover { color: var(--text); border-color: var(--muted); }
+  .d-chart { position: relative; margin-top: 12px; }
+  #dCanvas { height: 300px; margin: 0; touch-action: pan-y; cursor: crosshair; }
+  #dTip { position: absolute; top: 0; padding: 2px 8px; border-radius: 6px; font-size: 12px;
+          background: var(--text); color: var(--panel); white-space: nowrap; pointer-events: none;
+          font-variant-numeric: tabular-nums; }
+  .d-title { margin: 14px 0 6px; font-size: 11px; font-weight: 600; letter-spacing: 0.06em;
+             text-transform: uppercase; color: var(--muted); }
+  .d-title span { text-transform: none; letter-spacing: 0; font-weight: 400; }
+  .stats { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(112px, 1fr)); }
+  .stat { border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px; min-width: 0; }
+  .stat span { display: block; color: var(--muted); font-size: 11px; }
+  .stat b { font-variant-numeric: tabular-nums; font-weight: 600; }
+  .d-note { margin-top: 12px; color: var(--muted); font-size: 12px; }
+  @media (max-width: 560px) { #dCanvas { height: 220px; } .d-sym, .d-price #dPx { font-size: 17px; } }
 </style>
 </head>
 <body>
@@ -83,6 +116,25 @@
 <div id="grid"></div>
 <div id="empty" hidden></div>
 
+<dialog id="detail" aria-labelledby="dSym">
+  <div class="d-body">
+    <div class="d-head">
+      <div><div class="d-sym" id="dSym"></div><div class="d-name" id="dName"></div></div>
+      <div class="d-price"><span id="dPx"></span> <span id="dChg" class="chg"></span>
+        <div class="d-sub" id="dSub"></div></div>
+      <button id="dClose" aria-label="Close">&times;</button>
+    </div>
+    <div class="d-chart"><canvas id="dCanvas"></canvas><div id="dTip" hidden></div></div>
+    <div class="d-title">Today</div>
+    <div class="stats" id="dToday"></div>
+    <div id="dFnoWrap" hidden>
+      <div class="d-title">Derivatives <span id="dFut"></span></div>
+      <div class="stats" id="dFno"></div>
+    </div>
+    <div class="d-note" id="dNote" hidden></div>
+  </div>
+</dialog>
+
 <script>
 const grid = document.getElementById('grid'), empty = document.getElementById('empty');
 const tiles = new Map();      // sym -> {name, pts, el, canvas, chgEl, pxEl, dirty, pct}
@@ -102,6 +154,9 @@ function makeTile(sym, name, pts, group, order) {
   el.querySelector('.sym').textContent = sym;
   const t = { sym, name, pts, group, order, el, canvas: el.querySelector('canvas'),
               chgEl: el.querySelector('.chg'), pxEl: el.querySelector('.px'), pct: 0 };
+  el.tabIndex = 0;
+  el.addEventListener('click', () => openDetail(t));
+  el.addEventListener('keydown', e => { if (e.key === 'Enter') openDetail(t); });
   tiles.set(sym, t);
   return t;
 }
@@ -145,6 +200,7 @@ function draw(t) {
 
 function flush() {
   for (const sym of dirty) { const t = tiles.get(sym); if (t) draw(t); }
+  if (shown && dirty.has(shown.sym)) renderDetail();
   dirty.clear();
   updateCounts();
 }
@@ -222,6 +278,142 @@ function setStatus(st, offline) {
   }
 }
 
+// ------------------------------------------------------------- detail modal
+const dlg = document.getElementById('detail'), big = document.getElementById('dCanvas');
+const tip = document.getElementById('dTip'), $ = id => document.getElementById(id);
+let shown = null, info = null, hoverX = null, infoTimer = 0;
+
+const num = (v, d = 2) => v == null || isNaN(v) ? '—'
+  : Number(v).toLocaleString('en-IN', { minimumFractionDigits: d, maximumFractionDigits: d });
+const signed = (v, d = 2) => v == null || isNaN(v) ? '—' : (v > 0 ? '+' : '') + num(v, d);
+const dirOf = v => v > 0 ? 'up' : v < 0 ? 'down' : 'flat';
+const clock = ts => new Date(ts * 1000).toLocaleTimeString('en-IN',
+  { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Asia/Kolkata' });
+const stat = (label, value, cls) =>
+  `<div class="stat"><span>${label}</span><b class="${cls || ''}">${value}</b></div>`;
+
+function openDetail(t) {
+  shown = t; info = null; hoverX = null;
+  $('dSym').textContent = t.sym; $('dName').textContent = t.name;
+  if (!dlg.open) dlg.showModal();
+  renderDetail(); loadInfo();
+  clearInterval(infoTimer); infoTimer = setInterval(loadInfo, 5000);
+}
+function loadInfo() {
+  if (!shown) return;
+  const sym = shown.sym;
+  fetch('/api/detail/' + encodeURIComponent(sym)).then(r => r.json()).then(d => {
+    if (shown && shown.sym === sym && !d.error) { info = d; renderDetail(); }
+  }).catch(() => {});
+}
+
+function renderDetail() {
+  const t = shown, pts = t.pts, cur = t.group === 'stocks' ? '₹' : '';
+  const q = info && info.quote, f = info && info.fut;
+  let open = null, hi = null, lo = null, last = null;
+  if (pts.length) {
+    open = pts[0][1]; last = pts[pts.length - 1][1]; hi = -Infinity; lo = Infinity;
+    for (const p of pts) { if (p[1] > hi) hi = p[1]; if (p[1] < lo) lo = p[1]; }
+  }
+  const prev = q && q.prevClose != null ? q.prevClose : null;
+  const base = prev != null ? prev : open;
+  const chg = last != null && base ? last - base : null;
+  $('dPx').textContent = last != null ? cur + num(last) : '—';
+  $('dChg').className = 'chg ' + dirOf(chg);
+  $('dChg').textContent = chg != null ? `${signed(chg)} (${signed(chg / base * 100)}%)` : '';
+  $('dSub').textContent = chg == null ? 'No data yet'
+    : prev != null ? 'vs previous close' : "since today's first price";
+
+  $('dToday').innerHTML = stat('Open', num(open)) + stat('High', num(hi)) + stat('Low', num(lo)) +
+    stat('Previous close', num(prev)) +
+    (t.group === 'stocks' ? stat('Volume', q ? num(q.volume, 0) : '—') : '') +
+    stat('52-week high', q ? num(q.high52) : '—') + stat('52-week low', q ? num(q.low52) : '—');
+
+  const hasFut = !!(info && info.futSymbol);
+  $('dFnoWrap').hidden = !hasFut;
+  if (hasFut) {
+    const prem = f && f.last != null && last != null ? f.last - last : null;
+    $('dFut').textContent = '· ' + info.futSymbol;
+    $('dFno').innerHTML = stat('Futures price', f ? num(f.last) : '—') +
+      stat('Premium to spot', prem != null ? `${signed(prem)} (${signed(prem / last * 100)}%)` : '—', dirOf(prem)) +
+      stat('Open interest', f ? num(f.oi, 0) : '—') +
+      stat('OI change today', f && f.oiChangePct != null ? signed(f.oiChangePct) + '%' : '—',
+           f ? dirOf(f.oiChangePct) : '') +
+      stat('Lot size', num(info.lot, 0)) +
+      stat('Expiry', new Date(info.expiry + 'T00:00:00').toLocaleDateString('en-IN',
+           { day: 'numeric', month: 'short', year: 'numeric' }));
+  }
+  const missing = info && !q;
+  $('dNote').hidden = !missing;
+  if (missing) $('dNote').textContent = 'Previous close, volume, 52-week range, futures price and ' +
+    'open interest need market-data access on your Groww Trade API account.';
+  drawBig(prev, chg);
+}
+
+function drawBig(prev, chg) {
+  const pts = shown.pts, w = big.clientWidth, h = big.clientHeight, dpr = window.devicePixelRatio || 1;
+  if (!w || !h) return;
+  big.width = Math.round(w * dpr); big.height = Math.round(h * dpr);
+  const g = big.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  tip.hidden = true;
+  if (!pts.length) return;
+  const m = { l: 6, r: 62, t: 22, b: 22 }, pw = w - m.l - m.r, ph = h - m.t - m.b;
+  let lo = Infinity, hi = -Infinity;
+  for (const p of pts) { if (p[1] < lo) lo = p[1]; if (p[1] > hi) hi = p[1]; }
+  if (prev != null) { lo = Math.min(lo, prev); hi = Math.max(hi, prev); }
+  if (hi === lo) { hi += 1; lo -= 1; }
+  const padY = (hi - lo) * 0.06; lo -= padY; hi += padY;
+  const t0 = pts[0][0], span = Math.max(pts[pts.length - 1][0] - t0, 60);
+  const x = ts => m.l + (pts.length === 1 ? pw / 2 : (ts - t0) / span * pw);
+  const y = v => m.t + (hi - v) / (hi - lo) * ph;
+
+  g.font = '11px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+  g.textBaseline = 'middle'; g.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {                       // price grid
+    const v = lo + (hi - lo) * i / 4, yy = Math.round(y(v)) + 0.5;
+    g.strokeStyle = color('--line'); g.beginPath(); g.moveTo(m.l, yy); g.lineTo(m.l + pw, yy); g.stroke();
+    g.fillStyle = color('--muted'); g.textAlign = 'left'; g.fillText(num(v), m.l + pw + 6, yy);
+  }
+  g.textAlign = 'center';                              // time labels
+  const labels = Math.max(2, Math.min(6, Math.floor(pw / 90)));
+  for (let i = 0; i <= labels; i++) {
+    const ts = t0 + span * i / labels;
+    g.textAlign = i === 0 ? 'left' : i === labels ? 'right' : 'center';
+    g.fillText(clock(ts), x(ts), h - m.b / 2);
+  }
+  if (prev != null) {                                  // previous close
+    g.strokeStyle = color('--muted'); g.setLineDash([4, 4]);
+    g.beginPath(); g.moveTo(m.l, y(prev)); g.lineTo(m.l + pw, y(prev)); g.stroke(); g.setLineDash([]);
+    g.textAlign = 'left'; g.fillText('Prev close', m.l + 4, y(prev) - 8);
+  }
+  const stroke = color('--' + dirOf(chg));
+  g.beginPath();
+  pts.forEach((p, i) => i ? g.lineTo(x(p[0]), y(p[1])) : g.moveTo(x(p[0]), y(p[1])));
+  g.strokeStyle = stroke; g.lineWidth = 1.8; g.lineJoin = 'round'; g.stroke();
+  g.lineTo(x(pts[pts.length - 1][0]), m.t + ph); g.lineTo(x(t0), m.t + ph); g.closePath();
+  g.globalAlpha = 0.10; g.fillStyle = stroke; g.fill(); g.globalAlpha = 1;
+
+  if (hoverX != null) {                                // crosshair on the nearest minute
+    let best = pts[0];
+    for (const p of pts) if (Math.abs(x(p[0]) - hoverX) < Math.abs(x(best[0]) - hoverX)) best = p;
+    const hx = x(best[0]), hy = y(best[1]);
+    g.strokeStyle = color('--muted'); g.lineWidth = 1;
+    g.beginPath(); g.moveTo(hx, m.t); g.lineTo(hx, m.t + ph); g.stroke();
+    g.fillStyle = stroke; g.beginPath(); g.arc(hx, hy, 4, 0, Math.PI * 2); g.fill();
+    tip.hidden = false;
+    tip.textContent = `${clock(best[0])} · ${shown.group === 'stocks' ? '₹' : ''}${num(best[1])}`;
+    tip.style.left = Math.max(0, Math.min(w - tip.offsetWidth, hx - tip.offsetWidth / 2)) + 'px';
+  }
+}
+
+big.addEventListener('pointermove', e => { hoverX = e.offsetX; if (shown) renderDetail(); });
+big.addEventListener('pointerleave', () => { hoverX = null; if (shown) renderDetail(); });
+$('dClose').addEventListener('click', () => dlg.close());
+dlg.addEventListener('click', e => { if (e.target === dlg) dlg.close(); });   // click on backdrop
+dlg.addEventListener('close', () => { shown = null; clearInterval(infoTimer); });
+window.addEventListener('resize', () => { if (shown) renderDetail(); });
+
 function connect() {
   const ws = new WebSocket(`ws://${location.host}/ws`);
   ws.onmessage = ev => {
@@ -229,6 +421,7 @@ function connect() {
     if (m.type === 'snapshot') {
       tiles.clear();
       m.symbols.forEach((s, i) => makeTile(s.s, s.n, s.p, s.g || 'stocks', i));
+      if (shown) { shown = tiles.get(shown.sym) || null; if (shown) renderDetail(); else dlg.close(); }
       setStatus(m.status);
       layout();
       if (!m.symbols.length) setTimeout(() => ws.close(), 2000);   // still loading: reconnect
