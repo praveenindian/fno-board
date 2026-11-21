@@ -23,6 +23,7 @@ load_dotenv(ROOT / ".env")
 
 SOURCE = os.getenv("DATA_SOURCE", "groww").lower()
 PORT = int(os.getenv("PORT", "8765"))
+HOST = os.getenv("HOST", "127.0.0.1")   # set HOST=0.0.0.0 to open it to phones on the same Wi-Fi
 INSTRUMENT_CSV = "https://growwapi-assets.groww.in/instruments/instrument.csv"
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 
@@ -277,4 +278,4 @@ async def ws_endpoint(ws: WebSocket):
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=PORT, log_level="warning")
+    uvicorn.run(app, host=HOST, port=PORT, log_level="warning")
