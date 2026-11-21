@@ -5,8 +5,10 @@ Set DATA_SOURCE=demo in .env (or the environment) for simulated prices.
 """
 import asyncio
 import datetime as dt
+import json
 import os
 import random
+import re
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -26,6 +28,11 @@ PORT = int(os.getenv("PORT", "8765"))
 HOST = os.getenv("HOST", "127.0.0.1")   # set HOST=0.0.0.0 to open it to phones on the same Wi-Fi
 INSTRUMENT_CSV = "https://growwapi-assets.groww.in/instruments/instrument.csv"
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
+# Finished days are saved here, one JSON file per instrument: archive/2026-11-20/RELIANCE.json
+# Simulated days go to a separate "-demo" folder so they never mix with real ones.
+ARCHIVE = ROOT / (os.getenv("ARCHIVE_DIR", "archive") + ("-demo" if SOURCE == "demo" else ""))
+MARKET_OPEN = dt.time(9, 15)
+ARCHIVE_AT = dt.time(16, 5)             # IST; the last 1-minute candle of a session is 15:59
 
 
 def ist_date(epoch):
@@ -131,6 +138,7 @@ def near_futures(df):
     out = {}
     for r in fut[fut.expiry_date >= today].sort_values("expiry_date").itertuples():
         out.setdefault(r.underlying_symbol, {"exchange": r.exchange, "symbol": r.trading_symbol,
+                                             "groww_symbol": r.groww_symbol,
                                              "expiry": r.expiry_date, "lot": int(float(r.lot_size))})
     return out
 
@@ -140,6 +148,205 @@ def fut_for(futs, sym):
 
 
 groww_client = None
+groww_symbols = {}                       # sym -> (exchange, groww_symbol)
+
+
+# --------------------------------------------------------------------- archive
+
+archive_lock = threading.Lock()          # one archiving pass at a time
+day_cache = {}                           # day -> assembled board for the Archive view
+
+
+def archive_file(day, sym):
+    return ARCHIVE / day / (re.sub(r"[^A-Za-z0-9&_.-]", "_", sym) + ".json")
+
+
+def session_over(day):
+    now = dt.datetime.now(IST)
+    return day < now.date().isoformat() or now.time() >= ARCHIVE_AT
+
+
+def save_day(sym, day, rows, kind, prev_close=None):
+    """Write one instrument's finished day. rows are [epoch, open, high, low, close, volume].
+
+    kind is "candles" for exchange candles or "prices" when only the prices this board
+    saw are known. A "prices" file is replaced once candles are available for that day."""
+    info, path = board.symbols.get(sym), archive_file(day, sym)
+    if not info or not rows:
+        return
+    if path.exists():
+        try:
+            if kind != "candles" or json.loads(path.read_text()).get("kind") == "candles":
+                return
+        except ValueError:
+            pass                                 # unreadable file: write it again
+    volumes = [r[5] for r in rows if r[5] is not None]
+    # Open, high and low come from the regular session; pre-open candles (09:00-09:14) only
+    # carry indicative prices. They stay in "candles" so the file keeps everything received.
+    regular = [r for r in rows if is_regular(r)] or rows
+    doc = {
+        "symbol": sym, "name": info["name"], "group": info["group"], "exchange": info["exchange"],
+        "date": day, "source": SOURCE, "kind": kind,
+        "open": regular[0][1], "high": max(r[2] for r in regular), "low": min(r[3] for r in regular),
+        "close": rows[-1][4], "prevClose": prev_close,
+        "volume": sum(volumes) if volumes else None,
+        "fut": None,                             # filled in by archive_futures
+        "columns": ["time", "open", "high", "low", "close", "volume"],
+        "candles": rows,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(doc, separators=(",", ":")))
+    tmp.replace(path)
+    day_cache.pop(day, None)
+
+
+def save_days(sym, days):
+    """Archive every finished day in {day: candle rows}."""
+    prev = None
+    for day in sorted(days):
+        if session_over(day):
+            save_day(sym, day, days[day], "candles", prev)
+        prev = days[day][-1][4]
+
+
+def save_from_board(sym, day):
+    """Fallback when candles are unavailable: keep the prices the board collected."""
+    with board.lock:
+        pts = [list(p) for p in board.symbols[sym]["points"]]
+    save_day(sym, day, [[t, p, p, p, p, None] for t, p in pts if ist_date(t).isoformat() == day],
+             "prices")
+
+
+def is_regular(row):
+    return dt.datetime.fromtimestamp(row[0], IST).time() >= MARKET_OPEN
+
+
+def fut_figures(rows, prev):
+    """One day's summary for a futures contract. rows are [epoch, o, h, l, c, volume, oi]."""
+    regular = [r for r in rows if is_regular(r)] or rows
+    volumes = [r[5] for r in rows if r[5] is not None]
+    return {"open": regular[0][1], "high": max(r[2] for r in regular),
+            "low": min(r[3] for r in regular), "close": rows[-1][4],
+            "prevClose": prev and prev["close"], "volume": sum(volumes) if volumes else None,
+            "oi": next((r[6] for r in reversed(rows) if r[6] is not None), None),
+            "prevOi": prev and prev["oi"]}
+
+
+def archive_futures(g):
+    """Add the nearest futures contract's price, volume and open interest for the day to
+    recently saved files that do not have them yet. Only the day's summary is kept."""
+    since = (dt.datetime.now(IST) - dt.timedelta(days=5)).date().isoformat()
+    recent = [d for d in archive_days() if d >= since]
+    failures = 0
+    for sym, info in list(board.symbols.items()):
+        f = info["fut"]
+        if not f or not f.get("groww_symbol"):
+            continue
+        todo = {}                                # day -> (path, saved file) still lacking figures
+        for day in recent:
+            path = archive_file(day, sym)
+            try:
+                doc = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            if not doc.get("fut") or "close" not in doc["fut"]:
+                todo[day] = (path, doc)
+        if not todo:
+            continue
+        try:
+            days = fetch_candles(g, f["exchange"], f["groww_symbol"], "FNO")
+            failures = 0
+        except Exception:
+            failures += 1
+            if failures >= 3:
+                return
+            continue
+        finally:
+            time.sleep(0.3)
+        contract = {"symbol": f["symbol"], "expiry": f["expiry"], "lot": f["lot"]}
+        blank = dict.fromkeys(("open", "high", "low", "close", "prevClose", "volume", "oi", "prevOi"))
+        prev = None
+        for day in sorted(set(days) | set(todo)):
+            figures = fut_figures(days[day], prev) if day in days else None
+            prev = figures or prev
+            if day in todo:                      # no trades that day: saved blank, not retried
+                path, doc = todo[day]
+                doc["fut"] = {**contract, **(figures or blank)}
+                tmp = path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(doc, separators=(",", ":")))
+                tmp.replace(path)
+
+
+def end_of_day(day):
+    """Archive today's session for every instrument that has no file yet."""
+    with archive_lock:
+        failures = 0
+        for sym in list(board.symbols):
+            if archive_file(day, sym).exists():
+                continue
+            days = None
+            if groww_client and sym in groww_symbols and failures < 3:
+                try:
+                    days = fetch_candles(groww_client, *groww_symbols[sym])
+                    failures = 0
+                except Exception:
+                    failures += 1
+                time.sleep(0.3)
+            if days and day in days:
+                save_days(sym, days)
+            else:
+                save_from_board(sym, day)
+        if groww_client:
+            archive_futures(groww_client)
+
+
+def archive_loop():
+    """Once the market has closed, save the day if the board saw any prices for it."""
+    done = None
+    while True:
+        time.sleep(30)
+        now = dt.datetime.now(IST)
+        day = now.date().isoformat()
+        if day == done or now.time() < ARCHIVE_AT:
+            continue
+        with board.lock:
+            traded = any(v["points"] and ist_date(v["points"][-1][0]).isoformat() == day
+                         for v in board.symbols.values())
+        if not board.symbols or board.status["state"] == "starting":
+            continue                             # instruments still loading
+        if traded:
+            try:
+                end_of_day(day)
+            except Exception as e:
+                print(f"Archive for {day} failed: {type(e).__name__}: {e}")
+        done = day
+
+
+def archive_days():
+    if not ARCHIVE.is_dir():
+        return []
+    return sorted((d.name for d in ARCHIVE.iterdir()
+                   if d.is_dir() and re.fullmatch(r"\d{4}-\d{2}-\d{2}", d.name)), reverse=True)
+
+
+def archive_board(day):
+    """Every instrument saved for one day, in the same shape as the live snapshot."""
+    if day not in day_cache:
+        order = {s: i for i, s in enumerate(list(board.symbols))}
+        out = []
+        for f in (ARCHIVE / day).glob("*.json"):
+            try:
+                d = json.loads(f.read_text())
+                out.append({"s": d["symbol"], "n": d["name"], "g": d["group"],
+                            "p": [[c[0], c[4]] for c in d["candles"]]})
+            except (ValueError, KeyError, IndexError):
+                continue
+        out.sort(key=lambda x: (order.get(x["s"], len(order)), x["s"]))
+        while len(day_cache) >= 6:
+            day_cache.pop(next(iter(day_cache)))
+        day_cache[day] = {"day": day, "symbols": out}
+    return day_cache[day]
 
 
 # ---------------------------------------------------------------- Groww source
@@ -150,28 +357,55 @@ def parse_candle_time(t):
     return int(dt.datetime.fromisoformat(str(t).replace(" ", "T")).replace(tzinfo=IST).timestamp())
 
 
-def groww_backfill(g, stocks):
-    """Load the latest session's 1-minute candles for each stock."""
+def fetch_candles(g, exchange, groww_symbol, segment="CASH"):
+    """1-minute candles for the last few sessions: {day: [[epoch, o, h, l, c, volume], ...]}.
+    Futures (segment "FNO") rows carry open interest as a seventh value."""
     now = dt.datetime.now(IST)
-    start = (now - dt.timedelta(days=5)).strftime("%Y-%m-%d 09:15:00")
-    end = now.strftime("%Y-%m-%d %H:%M:%S")
+    r = g.get_historical_candles(exchange=exchange, segment=segment, groww_symbol=groww_symbol,
+                                 start_time=(now - dt.timedelta(days=5)).strftime("%Y-%m-%d 09:00:00"),
+                                 end_time=now.strftime("%Y-%m-%d %H:%M:%S"),
+                                 candle_interval=g.CANDLE_INTERVAL_MIN_1)
+    days = {}
+    for c in r.get("candles", []):
+        if c[4] is None:
+            continue
+        t = parse_candle_time(c[0])
+        o, h, lo = (c[i] if c[i] is not None else c[4] for i in (1, 2, 3))
+        row = [t, o, h, lo, c[4], c[5] if len(c) > 5 else None]
+        if segment == "FNO":
+            row.append(c[6] if len(c) > 6 else None)
+        days.setdefault(ist_date(t).isoformat(), []).append(row)
+    for rows in days.values():
+        rows.sort(key=lambda row: row[0])
+    return days
+
+
+def groww_backfill(g):
+    """Chart the latest session for each instrument and archive any finished days not yet saved."""
     failures = 0
-    for sym, exchange, groww_symbol in stocks:
+    with archive_lock:
+        for sym, (exchange, groww_symbol) in list(groww_symbols.items()):
+            try:
+                days = fetch_candles(g, exchange, groww_symbol)
+                if days:
+                    board.set_history(sym, [[c[0], c[4]] for c in days[max(days)]])
+                failures = 0
+            except Exception as e:
+                failures += 1
+                if failures >= 3:
+                    board.set_status(board.status["state"], f"History unavailable: {e}")
+                    return
+                days = None
+            if days:
+                try:
+                    save_days(sym, days)
+                except OSError as e:
+                    print(f"Archive write failed: {e}")
+            time.sleep(0.3)
         try:
-            r = g.get_historical_candles(exchange=exchange, segment="CASH", groww_symbol=groww_symbol,
-                                         start_time=start, end_time=end,
-                                         candle_interval=g.CANDLE_INTERVAL_MIN_1)
-            pts = [[parse_candle_time(c[0]), c[4]] for c in r.get("candles", []) if c[4] is not None]
-            if pts:
-                last_day = ist_date(pts[-1][0])
-                board.set_history(sym, [p for p in pts if ist_date(p[0]) == last_day])
-            failures = 0
-        except Exception as e:
-            failures += 1
-            if failures >= 3:
-                board.set_status(board.status["state"], f"History unavailable: {e}")
-                return
-        time.sleep(0.3)
+            archive_futures(g)
+        except OSError as e:
+            print(f"Archive write failed: {e}")
 
 
 def run_groww():
@@ -198,8 +432,9 @@ def run_groww():
         feed.subscribe_index_value(as_list(index_keys))
         board.set_status("live")
         rows = pd.concat([indices, cash])
-        threading.Thread(target=groww_backfill, daemon=True, args=(
-            g, list(zip(rows.trading_symbol, rows.exchange, rows.groww_symbol)))).start()
+        groww_symbols.update({s: (e, gs) for s, e, gs in
+                              zip(rows.trading_symbol, rows.exchange, rows.groww_symbol)})
+        threading.Thread(target=groww_backfill, daemon=True, args=(g,)).start()
 
         def ingest(data, keys, wrapper):
             data = (data or {}).get(wrapper, data or {})
@@ -276,6 +511,7 @@ async def broadcaster():
 @asynccontextmanager
 async def lifespan(app):
     threading.Thread(target=run_demo if SOURCE == "demo" else run_groww, daemon=True).start()
+    threading.Thread(target=archive_loop, daemon=True).start()
     task = asyncio.create_task(broadcaster())
     yield
     task.cancel()
@@ -348,6 +584,28 @@ def detail(sym: str):
                 out["note"] = out["note"] or str(e)
     detail_cache[sym] = (time.time(), out)
     return out
+
+
+@app.get("/api/archive")
+def archive_index():
+    """Days that have been archived, newest first."""
+    return {"days": archive_days()}
+
+
+@app.get("/api/archive/{day}")
+def archive_day(day: str):
+    if day not in archive_days():
+        return JSONResponse({"error": "no archive for that day"}, status_code=404)
+    return archive_board(day)
+
+
+@app.get("/archive/{day}/{name}.json")
+def archive_one(day: str, name: str):
+    """One instrument's saved day, straight from its file."""
+    path = archive_file(day, name)
+    if day not in archive_days() or not path.is_file():
+        return JSONResponse({"error": "not archived"}, status_code=404)
+    return FileResponse(path, media_type="application/json")
 
 
 @app.websocket("/ws")

@@ -84,13 +84,19 @@
   .stat span { display: block; color: var(--muted); font-size: 11px; }
   .stat b { font-variant-numeric: tabular-nums; font-weight: 600; }
   .d-note { margin-top: 12px; color: var(--muted); font-size: 12px; }
+  .d-note a { color: var(--accent); }
   @media (max-width: 560px) { #dCanvas { height: 220px; } .d-sym, .d-price #dPx { font-size: 17px; } }
 </style>
 </head>
 <body>
 <header>
   <h1>F&amp;O Board</h1>
-  <div class="tabs" role="tablist">
+  <div class="tabs" id="modes" role="tablist" aria-label="Live prices or archived days">
+    <button role="tab" data-mode="live" aria-selected="true">Live</button>
+    <button role="tab" data-mode="archive" aria-selected="false">Archive</button>
+  </div>
+  <select id="day" title="Archived day" hidden></select>
+  <div class="tabs" id="groups" role="tablist">
     <button role="tab" data-tab="stocks" aria-selected="true">F&amp;O Stocks</button>
     <button role="tab" data-tab="indices" aria-selected="false">Indices</button>
   </div>
@@ -125,19 +131,22 @@
       <button id="dClose" aria-label="Close">&times;</button>
     </div>
     <div class="d-chart"><canvas id="dCanvas"></canvas><div id="dTip" hidden></div></div>
-    <div class="d-title">Today</div>
+    <div class="d-title" id="dDay">Today</div>
     <div class="stats" id="dToday"></div>
     <div id="dFnoWrap" hidden>
       <div class="d-title">Derivatives <span id="dFut"></span></div>
       <div class="stats" id="dFno"></div>
     </div>
     <div class="d-note" id="dNote" hidden></div>
+    <div class="d-note" id="dFileWrap" hidden><a id="dFile">Download this day as JSON</a></div>
   </div>
 </dialog>
 
 <script>
 const grid = document.getElementById('grid'), empty = document.getElementById('empty');
-const tiles = new Map();      // sym -> {name, pts, el, canvas, chgEl, pxEl, dirty, pct}
+// sym -> {name, pts, el, canvas, chgEl, pxEl, pct}. `tiles` is whichever set is on screen.
+const live = new Map(), arch = new Map();
+let tiles = live, mode = 'live', archDay = null;
 const dirty = new Set();
 let css = getComputedStyle(document.documentElement);
 const color = n => css.getPropertyValue(n).trim();
@@ -146,7 +155,7 @@ let tab = 'stocks';
 try { tab = localStorage.getItem('fno-board-tab') === 'indices' ? 'indices' : 'stocks'; } catch (e) {}
 const inTab = t => t.group === tab;
 
-function makeTile(sym, name, pts, group, order) {
+function makeTile(store, sym, name, pts, group, order) {
   const el = document.createElement('div');
   el.className = 'tile'; el.title = name;
   el.innerHTML = '<div class="row"><span class="sym"></span><span class="chg flat">--</span></div>' +
@@ -157,7 +166,7 @@ function makeTile(sym, name, pts, group, order) {
   el.tabIndex = 0;
   el.addEventListener('click', () => openDetail(t));
   el.addEventListener('keydown', e => { if (e.key === 'Enter') openDetail(t); });
-  tiles.set(sym, t);
+  store.set(sym, t);
   return t;
 }
 
@@ -272,7 +281,7 @@ function setStatus(st, offline) {
   pill.className = 'pill ' + st.state;
   const label = { live: 'Live · Groww', demo: 'Demo data', starting: 'Starting', error: 'Error' }[st.state] || st.state;
   text.textContent = st.detail ? label + ' · ' + st.detail : label;
-  if (!tiles.size) {
+  if (mode === 'live' && !live.size) {
     empty.hidden = false;
     empty.textContent = st.state === 'error' ? 'Could not load data: ' + st.detail : 'Loading companies…';
   }
@@ -297,24 +306,34 @@ function openDetail(t) {
   $('dSym').textContent = t.sym; $('dName').textContent = t.name;
   if (!dlg.open) dlg.showModal();
   renderDetail(); loadInfo();
-  clearInterval(infoTimer); infoTimer = setInterval(loadInfo, 5000);
+  clearInterval(infoTimer);
+  if (mode === 'live') infoTimer = setInterval(loadInfo, 5000);
 }
 function loadInfo() {
   if (!shown) return;
-  const sym = shown.sym;
-  fetch('/api/detail/' + encodeURIComponent(sym)).then(r => r.json()).then(d => {
-    if (shown && shown.sym === sym && !d.error) { info = d; renderDetail(); }
+  const sym = shown.sym, day = mode === 'archive' ? archDay : null;
+  const url = day ? `/archive/${day}/${encodeURIComponent(sym)}.json` : '/api/detail/' + encodeURIComponent(sym);
+  fetch(url).then(r => r.json()).then(d => {
+    if (!shown || shown.sym !== sym || d.error || (day && (mode !== 'archive' || archDay !== day))) return;
+    info = !day ? d : {                       // an archived day: figures come from its saved file
+      file: url, fileName: `${sym}-${day}.json`,
+      quote: { open: d.open, high: d.high, low: d.low, prevClose: d.prevClose, volume: d.volume },
+      fut: d.fut && d.fut.close != null ? { last: d.fut.close, oi: d.fut.oi, volume: d.fut.volume,
+        oiChangePct: d.fut.oi != null && d.fut.prevOi ? (d.fut.oi - d.fut.prevOi) / d.fut.prevOi * 100 : null } : null,
+      futSymbol: d.fut && d.fut.symbol, lot: d.fut && d.fut.lot, expiry: d.fut && d.fut.expiry };
+    renderDetail();
   }).catch(() => {});
 }
 
 function renderDetail() {
   const t = shown, pts = t.pts, cur = t.group === 'stocks' ? '₹' : '';
-  const q = info && info.quote, f = info && info.fut;
+  const q = info && info.quote, f = info && info.fut, old = mode === 'archive';
   let open = null, hi = null, lo = null, last = null;
   if (pts.length) {
     open = pts[0][1]; last = pts[pts.length - 1][1]; hi = -Infinity; lo = Infinity;
     for (const p of pts) { if (p[1] > hi) hi = p[1]; if (p[1] < lo) lo = p[1]; }
   }
+  if (q && q.high != null) { open = q.open; hi = q.high; lo = q.low; }   // archived day's own figures
   const prev = q && q.prevClose != null ? q.prevClose : null;
   const base = prev != null ? prev : open;
   const chg = last != null && base ? last - base : null;
@@ -322,28 +341,33 @@ function renderDetail() {
   $('dChg').className = 'chg ' + dirOf(chg);
   $('dChg').textContent = chg != null ? `${signed(chg)} (${signed(chg / base * 100)}%)` : '';
   $('dSub').textContent = chg == null ? 'No data yet'
-    : prev != null ? 'vs previous close' : "since today's first price";
+    : prev != null ? 'vs previous close' : old ? "since the day's first price" : "since today's first price";
 
+  $('dDay').textContent = old ? dayLabel(archDay) : 'Today';
   $('dToday').innerHTML = stat('Open', num(open)) + stat('High', num(hi)) + stat('Low', num(lo)) +
-    stat('Previous close', num(prev)) +
+    stat(old ? 'Close' : 'Previous close', num(old ? last : prev)) +
+    (old ? stat('Previous close', num(prev)) : '') +
     (t.group === 'stocks' ? stat('Volume', q ? num(q.volume, 0) : '—') : '') +
-    stat('52-week high', q ? num(q.high52) : '—') + stat('52-week low', q ? num(q.low52) : '—');
+    (old ? '' : stat('52-week high', q ? num(q.high52) : '—') + stat('52-week low', q ? num(q.low52) : '—'));
 
   const hasFut = !!(info && info.futSymbol);
   $('dFnoWrap').hidden = !hasFut;
   if (hasFut) {
     const prem = f && f.last != null && last != null ? f.last - last : null;
     $('dFut').textContent = '· ' + info.futSymbol;
-    $('dFno').innerHTML = stat('Futures price', f ? num(f.last) : '—') +
+    $('dFno').innerHTML = stat(old ? 'Futures close' : 'Futures price', f ? num(f.last) : '—') +
       stat('Premium to spot', prem != null ? `${signed(prem)} (${signed(prem / last * 100)}%)` : '—', dirOf(prem)) +
+      (old ? stat('Futures volume', f ? num(f.volume, 0) : '—') : '') +
       stat('Open interest', f ? num(f.oi, 0) : '—') +
-      stat('OI change today', f && f.oiChangePct != null ? signed(f.oiChangePct) + '%' : '—',
-           f ? dirOf(f.oiChangePct) : '') +
+      stat(old ? 'OI change on the day' : 'OI change today',
+           f && f.oiChangePct != null ? signed(f.oiChangePct) + '%' : '—', f ? dirOf(f.oiChangePct) : '') +
       stat('Lot size', num(info.lot, 0)) +
       stat('Expiry', new Date(info.expiry + 'T00:00:00').toLocaleDateString('en-IN',
            { day: 'numeric', month: 'short', year: 'numeric' }));
   }
   const missing = info && !q;
+  $('dFileWrap').hidden = !(info && info.file);
+  if (info && info.file) { $('dFile').href = info.file; $('dFile').download = info.fileName; }
   $('dNote').hidden = !missing;
   if (missing) $('dNote').textContent = 'Previous close, volume, 52-week range, futures price and ' +
     'open interest need market-data access on your Groww Trade API account.';
@@ -414,26 +438,79 @@ dlg.addEventListener('click', e => { if (e.target === dlg) dlg.close(); });   //
 dlg.addEventListener('close', () => { shown = null; clearInterval(infoTimer); });
 window.addEventListener('resize', () => { if (shown) renderDetail(); });
 
+// ------------------------------------------------------------------ archive
+// Finished days are saved by the server as one JSON file per instrument. Archive mode
+// shows a saved day in the same grid; the tabs, filter, sort and sizes work as in Live.
+const dayIn = $('day');
+const dayLabel = d => new Date(d + 'T00:00:00').toLocaleDateString('en-IN',
+  { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' });
+function say(text) { empty.hidden = false; empty.textContent = text; }
+
+function setMode(next) {
+  mode = next;
+  for (const b of document.querySelectorAll('#modes button'))
+    b.setAttribute('aria-selected', b.dataset.mode === mode);
+  if (dlg.open) dlg.close();
+  dayIn.hidden = mode !== 'archive';
+  dirty.clear();
+  if (mode === 'live') {
+    tiles = live; layout();
+    if (!live.size) say('Loading companies…');
+    return;
+  }
+  tiles = arch; arch.clear(); layout();
+  say('Loading archive…');
+  fetch('/api/archive').then(r => r.json()).then(d => {
+    if (mode !== 'archive') return;
+    dayIn.replaceChildren(...d.days.map(x => new Option(dayLabel(x), x)));
+    if (!d.days.length) {
+      dayIn.hidden = true;
+      return say('No days archived yet. Each trading day is saved shortly after the market closes, ' +
+                 'at 4:05 pm IST, while the board is running.');
+    }
+    if (d.days.includes(archDay)) dayIn.value = archDay;
+    loadDay(dayIn.value);
+  }).catch(() => { if (mode === 'archive') say('Could not load the archive.'); });
+}
+
+function loadDay(day) {
+  archDay = day;
+  if (dlg.open) dlg.close();
+  fetch('/api/archive/' + day).then(r => r.json()).then(d => {
+    if (mode !== 'archive' || archDay !== day) return;
+    arch.clear();
+    (d.symbols || []).forEach((s, i) => makeTile(arch, s.s, s.n, s.p, s.g, i));
+    layout();
+    if (!arch.size) say('Nothing was saved for this day.');
+  }).catch(() => { if (mode === 'archive' && archDay === day) say('Could not load that day.'); });
+}
+for (const b of document.querySelectorAll('#modes button'))
+  b.addEventListener('click', () => { if (b.dataset.mode !== mode) setMode(b.dataset.mode); });
+dayIn.addEventListener('change', () => loadDay(dayIn.value));
+
 function connect() {
   const ws = new WebSocket(`ws://${location.host}/ws`);
   ws.onmessage = ev => {
     const m = JSON.parse(ev.data);
     if (m.type === 'snapshot') {
-      tiles.clear();
-      m.symbols.forEach((s, i) => makeTile(s.s, s.n, s.p, s.g || 'stocks', i));
-      if (shown) { shown = tiles.get(shown.sym) || null; if (shown) renderDetail(); else dlg.close(); }
+      live.clear();
+      m.symbols.forEach((s, i) => makeTile(live, s.s, s.n, s.p, s.g || 'stocks', i));
       setStatus(m.status);
-      layout();
+      if (mode === 'live') {
+        if (shown) { shown = live.get(shown.sym) || null; if (shown) renderDetail(); else dlg.close(); }
+        layout();
+      }
       if (!m.symbols.length) setTimeout(() => ws.close(), 2000);   // still loading: reconnect
       return;
     }
     setStatus(m.status);
-    for (const sym in m.hist) { const t = tiles.get(sym); if (t) { t.pts = m.hist[sym]; dirty.add(sym); } }
+    const seen = sym => { if (mode === 'live') dirty.add(sym); };   // an archived day stays as saved
+    for (const sym in m.hist) { const t = live.get(sym); if (t) { t.pts = m.hist[sym]; seen(sym); } }
     for (const sym in m.ticks) {
-      const t = tiles.get(sym); if (!t) continue;
+      const t = live.get(sym); if (!t) continue;
       const [ts, price] = m.ticks[sym], last = t.pts[t.pts.length - 1];
       if (last && last[0] === ts) last[1] = price; else t.pts.push([ts, price]);
-      dirty.add(sym);
+      seen(sym);
     }
     schedule();
   };
@@ -443,12 +520,12 @@ function connect() {
 function setTab(next) {
   tab = next;
   try { localStorage.setItem('fno-board-tab', tab); } catch (e) {}
-  for (const b of document.querySelectorAll('.tabs button'))
+  for (const b of document.querySelectorAll('#groups button'))
     b.setAttribute('aria-selected', b.dataset.tab === tab);
   loadView();          // each tab keeps its own size, columns and rows
   layout();
 }
-for (const b of document.querySelectorAll('.tabs button'))
+for (const b of document.querySelectorAll('#groups button'))
   b.addEventListener('click', () => setTab(b.dataset.tab));
 document.getElementById('q').addEventListener('input', layout);
 document.getElementById('sort').addEventListener('change', layout);
@@ -466,7 +543,7 @@ window.addEventListener('resize', () => {
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
   css = getComputedStyle(document.documentElement); markAll();
 });
-for (const b of document.querySelectorAll('.tabs button'))
+for (const b of document.querySelectorAll('#groups button'))
   b.setAttribute('aria-selected', b.dataset.tab === tab);
 connect();
 </script>

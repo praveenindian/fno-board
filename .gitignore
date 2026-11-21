@@ -14,3 +14,7 @@ dist/
 
 # macOS
 .DS_Store
+
+# Archived price data
+archive/
+archive-demo/
