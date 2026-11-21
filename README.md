@@ -11,6 +11,7 @@ Instead of opening each derivative chart one by one in a trading app, fno-board 
 - Click any tile for a detail view: a larger chart with a hover crosshair, the day's open/high/low, previous close, volume and 52-week range, plus the nearest futures contract's price, premium to spot, open interest, lot size and expiry
 - **Archive**: every finished trading day is saved as one JSON file per stock and index, and can be reopened in the same grid from the Archive switch
 - Filter by name, sort by top gainers or losers
+- Under a gainers or losers sort the ranking refreshes every 15 seconds without tiles sliding around: a stock that comes into view gets a ring that fades, and the biggest movers already in view get a small ▲/▼ marker with the places moved. Changing the sort order glides tiles to their new places. Both respect the system's reduce-motion setting
 - Small / Medium / Large presets, or set exact column and row counts
 - Layout is remembered per tab and per screen, so a laptop and a monitor keep separate views
 - Light and dark themes that follow your system
@@ -89,7 +90,7 @@ Set these in `.env` or the environment.
 
 ## Status
 
-Early project. Demo mode and the Groww login and instrument list are tested. The live Groww price feed and candle history are wired from the SDK documentation but have not yet been run against a subscribed account during market hours, so expect fixes there.
+Early project. Demo mode, the Groww login and instrument list, quotes, 1-minute candle history and the archive of past sessions have been run against a subscribed account. The live Groww price feed and the 4:05 pm save have not yet been run during market hours, so expect fixes there. Groww returns no candles for a few indices (NIFTYMIDSELECT, BSEIPO, BSEMIDCAP, BSESMLCAP), so those tiles stay empty and are not archived.
 
 ## Disclaimer
 

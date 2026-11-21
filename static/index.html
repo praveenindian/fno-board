@@ -48,11 +48,13 @@
   .row { display: flex; justify-content: space-between; align-items: baseline; gap: 6px; }
   .sym { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .chg { font-variant-numeric: tabular-nums; font-weight: 600; white-space: nowrap; }
+  .rank { margin-right: auto; font-size: 11px; font-weight: 600; color: var(--muted);
+          white-space: nowrap; opacity: 0; font-variant-numeric: tabular-nums; }
   .px { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 12px; }
   .up { color: var(--up); } .down { color: var(--down); } .flat { color: var(--flat); }
   canvas { display: block; width: 100%; height: var(--chart, 56px); margin-top: 4px; }
   #empty { padding: 48px 16px; text-align: center; color: var(--muted); }
-  .tile { cursor: pointer; }
+  .tile { cursor: pointer; position: relative; }
   .tile { transition: border-color 0.15s; }
   .tile:hover { border-color: color-mix(in srgb, var(--muted) 40%, var(--line)); }
   .tile:focus-visible { border-color: var(--accent); outline: none; }
@@ -158,7 +160,7 @@ const inTab = t => t.group === tab;
 function makeTile(store, sym, name, pts, group, order) {
   const el = document.createElement('div');
   el.className = 'tile'; el.title = name;
-  el.innerHTML = '<div class="row"><span class="sym"></span><span class="chg flat">--</span></div>' +
+  el.innerHTML = '<div class="row"><span class="sym"></span><span class="rank"></span><span class="chg flat">--</span></div>' +
                  '<div class="px">--</div><canvas></canvas>';
   el.querySelector('.sym').textContent = sym;
   const t = { sym, name, pts, group, order, el, canvas: el.querySelector('canvas'),
@@ -229,17 +231,95 @@ function updateCounts() {
     ? `${n} ${tab === 'stocks' ? 'companies' : 'indices'} · <b class="up">${up} up</b> · <b class="down">${down} down</b>` : '';
 }
 
-function layout() {
+// layout('glide') is for a change of sort order: every tile glides from its old place to the
+// new one. layout('nudge') is the periodic re-rank while prices are being watched: tiles take
+// their new places at once with no movement. Tiles that came into view get a coloured ring,
+// and the biggest movers already in view get a small rank marker.
+const calm = matchMedia('(prefers-reduced-motion: reduce)');
+function layout(how) {
   const q = document.getElementById('q').value.trim().toLowerCase();
-  const mode = document.getElementById('sort').value;
+  const order = document.getElementById('sort').value;
   const list = [...tiles.values()].filter(t => inTab(t) &&
     (!q || t.sym.toLowerCase().includes(q) || t.name.toLowerCase().includes(q)));
-  if (mode === 'az') list.sort((a, b) => a.order - b.order);
-  else list.sort((a, b) => mode === 'gain' ? b.pct - a.pct : a.pct - b.pct);
+  if (order === 'az') list.sort((a, b) => a.order - b.order);
+  else list.sort((a, b) => order === 'gain' ? b.pct - a.pct : a.pct - b.pct);
+  const kids = grid.children;
+  if (how && list.length === kids.length && list.every((t, i) => t.el === kids[i])) return;
+  const from = how && !calm.matches ? new Map([...kids].map((el, i) =>
+    [el, { i, box: el.getBoundingClientRect() }])) : null;
   grid.replaceChildren(...list.map(t => t.el));
   empty.hidden = list.length > 0 || !tiles.size;
   if (!empty.hidden) empty.textContent = 'Nothing matches that filter.';
   applyGrid();
+  if (from && how === 'glide') glideTiles(list, from, order);
+  else if (from) nudgeTiles(list, from, order);
+  for (const t of list) t.was = t.pct;
+}
+
+// After a periodic re-rank, mark what changed without moving anything:
+//  - a tile that was off screen and is now in view gets a ring in the gain or loss colour;
+//  - among tiles that were already in view, the biggest movers get a grey rank marker.
+// "Moved" means outside the longest run of tiles that kept their order, so a tile that only
+// shifted because another one passed it is not counted. Movers need 3 places or more, and at
+// most 6 are marked, to keep the board calm.
+function nudgeTiles(list, from, order) {
+  const top = document.querySelector('header').getBoundingClientRect().bottom, vh = window.innerHeight;
+  const inView = b => b.bottom - top > b.height / 2 && vh - b.top > b.height / 2;   // at least half showing
+  const seq = [];                                   // [new index, old index, was in view]
+  list.forEach((t, i) => { const o = from.get(t.el); if (o) seq.push([i, o.i, inView(o.box)]); });
+  const tails = [], prev = new Array(seq.length).fill(-1);
+  seq.forEach(([, old], k) => {
+    let lo = 0, hi = tails.length;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (seq[tails[mid]][1] < old) lo = mid + 1; else hi = mid; }
+    if (lo > 0) prev[k] = tails[lo - 1];
+    tails[lo] = k;
+  });
+  const kept = new Set();
+  for (let k = tails.length ? tails[tails.length - 1] : -1; k >= 0; k = prev[k]) kept.add(k);
+
+  const mark = ([now, old], tint) => {
+    const t = list[now], badge = t.el.querySelector('.rank');
+    badge.textContent = now === old ? '' : (now < old ? '▲' : '▼') + Math.abs(now - old);
+    badge.style.color = tint || '';
+    for (const a of badge.getAnimations()) a.cancel();
+    badge.animate([{ opacity: 0 }, { opacity: 1, offset: 0.08 }, { opacity: 1, offset: 0.8 }, { opacity: 0 }],
+      { duration: 6000 });
+    if (tint) t.el.animate([
+      { boxShadow: `0 0 0 2px ${tint}, 0 0 20px -6px ${tint}` },
+      { boxShadow: `0 0 0 2px ${tint}, 0 0 20px -6px ${tint}`, offset: 0.45 },
+      { boxShadow: '0 0 0 0 transparent' }], { duration: 3200, easing: 'ease-out' });
+    else t.el.animate([{ borderColor: color('--muted') }, { borderColor: color('--line') }],
+      { duration: 2500, easing: 'ease-out' });
+  };
+  const ring = color(order === 'loss' ? '--down' : '--up'), movers = [];
+  seq.forEach((m, k) => {
+    const seen = inView(list[m[0]].el.getBoundingClientRect());
+    if (seen && !m[2]) mark(m, ring);                               // new to the view
+    else if (seen && !kept.has(k) && Math.abs(m[0] - m[1]) >= 3) movers.push(m);
+  });
+  movers.sort((a, b) => Math.abs(b[0] - b[1]) - Math.abs(a[0] - a[1])).slice(0, 6).forEach(m => mark(m));
+}
+
+function glideTiles(list, from, order) {
+  const vh = window.innerHeight, ring = color(order === 'loss' ? '--down' : '--up');
+  list.forEach((t, i) => {
+    const old = from.get(t.el);
+    if (!old) return;
+    const a = old.box, b = t.el.getBoundingClientRect();
+    const dx = a.left - b.left, dy = a.top - b.top;
+    if (!dx && !dy) return;
+    if ((a.bottom < 0 || a.top > vh) && (b.bottom < 0 || b.top > vh)) return;   // never on screen
+    const climbed = order !== 'az' && i < old.i && t.was != null &&
+      (order === 'gain' ? t.pct > t.was : t.pct < t.was);
+    t.el.style.zIndex = climbed ? 2 : 1;
+    const move = t.el.animate([{ transform: `translate(${dx}px, ${dy}px)` }, { transform: 'none' }],
+      { duration: 560, easing: 'cubic-bezier(0.22, 1, 0.36, 1)' });
+    move.onfinish = move.oncancel = () => { t.el.style.zIndex = ''; };
+    if (climbed) t.el.animate([
+      { boxShadow: `0 0 0 0 transparent` },
+      { boxShadow: `0 0 0 1.5px ${ring}, 0 8px 22px -10px ${ring}`, offset: 0.25 },
+      { boxShadow: `0 0 0 0 transparent` }], { duration: 1500, easing: 'ease-out' });
+  });
 }
 
 // Size preset = quick Small/Medium/Large. Columns and Rows fine-tune on top of it:
@@ -527,14 +607,14 @@ function setTab(next) {
 }
 for (const b of document.querySelectorAll('#groups button'))
   b.addEventListener('click', () => setTab(b.dataset.tab));
-document.getElementById('q').addEventListener('input', layout);
-document.getElementById('sort').addEventListener('change', layout);
+document.getElementById('q').addEventListener('input', () => layout());
+document.getElementById('sort').addEventListener('change', () => layout('glide'));
 for (const el of [colsIn, rowsIn]) el.addEventListener('input', () => { saveView(); applyGrid(); });
 sizeIn.addEventListener('change', () => {       // picking a preset returns to automatic fit
   colsIn.value = ''; rowsIn.value = ''; saveView(); applyGrid();
 });
 loadView();
-setInterval(() => { if (document.getElementById('sort').value !== 'az') layout(); }, 15000);
+setInterval(() => { if (document.getElementById('sort').value !== 'az') layout('nudge'); }, 15000);
 let lastScreen = viewKey();
 window.addEventListener('resize', () => {
   if (viewKey() !== lastScreen) { lastScreen = viewKey(); loadView(); }   // moved to another screen
