@@ -84,7 +84,9 @@
   .stats { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(112px, 1fr)); }
   .stat { border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px; min-width: 0; }
   .stat span { display: block; color: var(--muted); font-size: 11px; }
-  .stat b { font-variant-numeric: tabular-nums; font-weight: 600; }
+  .stat.wide { grid-column: span 2; }
+  .stat b { display: block; font-variant-numeric: tabular-nums; font-weight: 600;
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }   /* a value never wraps, so a row never grows */
   .d-note { margin-top: 12px; color: var(--muted); font-size: 12px; }
   .d-note a { color: var(--accent); }
   @media (max-width: 560px) { #dCanvas { height: 220px; } .d-sym, .d-price #dPx { font-size: 17px; } }
@@ -378,8 +380,8 @@ const signed = (v, d = 2) => v == null || isNaN(v) ? '—' : (v > 0 ? '+' : '') 
 const dirOf = v => v > 0 ? 'up' : v < 0 ? 'down' : 'flat';
 const clock = ts => new Date(ts * 1000).toLocaleTimeString('en-IN',
   { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Asia/Kolkata' });
-const stat = (label, value, cls) =>
-  `<div class="stat"><span>${label}</span><b class="${cls || ''}">${value}</b></div>`;
+const stat = (label, value, cls, wide) =>
+  `<div class="stat${wide ? ' wide' : ''}"><span>${label}</span><b class="${cls || ''}">${value}</b></div>`;
 
 function openDetail(t) {
   shown = t; info = null; hoverX = null;
@@ -437,7 +439,7 @@ function renderDetail() {
     const prem = f && f.last != null && last != null ? f.last - last : null;
     $('dFut').textContent = info ? '· ' + info.futSymbol : '';
     $('dFno').innerHTML = stat(old ? 'Futures close' : 'Futures price', f ? num(f.last) : '—') +
-      stat('Premium to spot', prem != null ? `${signed(prem)} (${signed(prem / last * 100)}%)` : '—', dirOf(prem)) +
+      stat('Premium to spot', prem != null ? `${signed(prem)} (${signed(prem / last * 100)}%)` : '—', dirOf(prem), true) +
       (old ? stat('Futures volume', f ? num(f.volume, 0) : '—') : '') +
       stat('Open interest', f ? num(f.oi, 0) : '—') +
       stat(old ? 'OI change on the day' : 'OI change today',
@@ -447,8 +449,9 @@ function renderDetail() {
            { day: 'numeric', month: 'short', year: 'numeric' }) : '—');
   }
   const missing = info && !q;
-  $('dFileWrap').hidden = !(info && info.file);
-  if (info && info.file) { $('dFile').href = info.file; $('dFile').download = info.fileName; }
+  $('dFileWrap').hidden = !old;               // the day's file is known up front, so the link never pops in
+  if (old) { $('dFile').href = `/archive/${archDay}/${encodeURIComponent(t.sym)}.json`;
+             $('dFile').download = `${t.sym}-${archDay}.json`; }
   $('dNote').hidden = !missing;
   if (missing) $('dNote').textContent = 'Previous close, volume, 52-week range, futures price and ' +
     'open interest need market-data access on your Groww Trade API account.';
