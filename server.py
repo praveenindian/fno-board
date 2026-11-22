@@ -89,7 +89,8 @@ class Board:
 
     def snapshot(self):
         with self.lock:
-            return [{"s": s, "n": v["name"], "g": v["group"], "p": [list(p) for p in v["points"]]}
+            return [{"s": s, "n": v["name"], "g": v["group"], "f": bool(v["fut"]),
+                     "p": [list(p) for p in v["points"]]}
                     for s, v in self.symbols.items()]
 
     def drain(self):
@@ -339,6 +340,7 @@ def archive_board(day):
             try:
                 d = json.loads(f.read_text())
                 out.append({"s": d["symbol"], "n": d["name"], "g": d["group"],
+                            "f": bool((d.get("fut") or {}).get("symbol")),
                             "p": [[c[0], c[4]] for c in d["candles"]]})
             except (ValueError, KeyError, IndexError):
                 continue
